@@ -77,6 +77,9 @@ class TransferAttacker:
         self.model, self.preprocess = clip.load('ViT-B/32', device=self.device)
         self.model.eval()
 
+        # 转换为float32以支持梯度计算（CLIP默认加载为fp16）
+        self.model = self.model.float()
+
         # CLIP normalize参数
         self.clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1).to(self.device)
         self.clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1).to(self.device)
