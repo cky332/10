@@ -379,26 +379,25 @@ class EnsembleTransferAttacker:
                 # TI-FGSM: 高斯核平滑梯度
                 grad = self._ti_smooth_gradient(grad)
 
-                # VMI-FGSM: 方差调节
-                if iteration > 0:
-                    # 在邻域采样计算梯度方差
-                    sample_grads = []
-                    for _ in range(self.vmi_num_samples):
-                        neighbor = perturbed.detach() + torch.randn_like(perturbed) * (self.vmi_beta * self.epsilon)
-                        neighbor = torch.clamp(neighbor, 0, 1)
-                        neighbor.requires_grad = True
-                        n_loss = self._compute_ensemble_loss(neighbor, target_indices, weights, original_tensor)
-                        n_loss.backward()
-                        sample_grads.append(neighbor.grad.clone())
-                        neighbor.requires_grad = False
+            # VMI-FGSM: 方差调节 (must be outside no_grad for backward)
+            if iteration > 0:
+                sample_grads = []
+                for _ in range(self.vmi_num_samples):
+                    neighbor = perturbed.detach() + torch.randn_like(perturbed) * (self.vmi_beta * self.epsilon)
+                    neighbor = torch.clamp(neighbor, 0, 1)
+                    neighbor.requires_grad = True
+                    n_loss = self._compute_ensemble_loss(neighbor, target_indices, weights, original_tensor)
+                    n_loss.backward()
+                    sample_grads.append(neighbor.grad.clone())
+                    neighbor.requires_grad = False
 
-                    # 计算邻域梯度均值
+                with torch.no_grad():
                     avg_neighbor_grad = torch.stack(sample_grads).mean(dim=0)
                     avg_neighbor_grad = self._ti_smooth_gradient(avg_neighbor_grad)
-                    # 结合当前梯度和邻域梯度
                     grad = grad + variance
                     variance = avg_neighbor_grad - grad
 
+            with torch.no_grad():
                 # MI-FGSM: 归一化 + 动量
                 grad = grad / (torch.abs(grad).mean(dim=[1, 2, 3], keepdim=True) + 1e-8)
                 momentum_grad = self.momentum * momentum_grad + grad
