@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-VIP5 Black-box Transfer Attack v5
+VIP5 Black-box Transfer Attack v6
 ===================================
-针对VIP5推荐系统的黑盒对抗攻击
+针对VIP5推荐系统的黑盒迁移对抗攻击
 
-关键改进：
-1. 正确的ID映射：数字ID → ASIN → 图片文件名 → 特征文件
-2. 保存224x224图片 - 避免双重缩放销毁对抗扰动
-3. 逐商品最近邻目标 - 攻击向最近的热门商品靠拢
-4. MI-FGSM with momentum for stable gradients
+核心设计 - 真正的迁移攻击：
+1. 使用不同于目标模型的代理模型集成（Surrogate Ensemble）
+   - VIP5目标模型: CLIP ViT-B/32
+   - 代理模型: CLIP RN50, RN101, ViT-L/14 (故意不包含ViT-B/32)
+2. 集成梯度：聚合多个代理模型的梯度，提高迁移性
+3. MI-FGSM + Input Diversity：增强对抗样本的迁移能力
+
+迁移攻击原理：
+  在代理模型上生成对抗样本 → 希望扰动能迁移到目标模型
+  这体现了黑盒攻击的本质：攻击者无法访问目标模型
 
 使用方法：
     python transfer_attack.py --split toys
@@ -39,6 +44,11 @@ import clip
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+# 代理模型配置（故意不包含VIP5使用的ViT-B/32，体现迁移攻击）
+SURROGATE_MODELS = ['RN50', 'RN101', 'ViT-L/14']
+# 目标模型（VIP5使用的模型，仅用于特征提取验证，不参与攻击）
+TARGET_MODEL = 'ViT-B/32'
+
 
 def load_pickle(filename):
     with open(filename, "rb") as f:
@@ -50,70 +60,118 @@ def load_json(file_path):
         return json.load(f)
 
 
-class TransferAttacker:
+class EnsembleTransferAttacker:
     """
-    V5 转移攻击器
+    集成迁移攻击器 (Ensemble Transfer Attacker)
 
-    核心设计：
-    1. 只用ViT-B/32（匹配VIP5和evaluate_attack.py）
-    2. 用CLIP方式处理图片做可微分攻击
-    3. 保存224x224图片，避免双重缩放销毁扰动
-    4. 逐商品最近邻目标
+    核心思想：
+    - 使用多个不同架构的代理模型（RN50, RN101, ViT-L/14）
+    - 故意排除目标模型（ViT-B/32）以体现真正的迁移攻击
+    - 聚合多个模型的梯度来生成更具迁移性的对抗样本
+
+    技术：
+    1. Ensemble Gradient: 多模型梯度平均
+    2. MI-FGSM: 动量迭代FGSM，稳定梯度方向
+    3. Input Diversity: 输入多样性变换，增强迁移性
     """
 
     def __init__(self, device='cuda', epsilon=0.15, max_iter=200,
-                 step_size=None, momentum=0.9):
+                 step_size=None, momentum=0.9, diversity_prob=0.5):
         self.device = device if torch.cuda.is_available() else 'cpu'
         self.epsilon = epsilon
         self.max_iter = max_iter
         self.step_size = step_size if step_size else 2.0 * epsilon / max_iter
         self.momentum = momentum
+        self.diversity_prob = diversity_prob  # Input Diversity概率
 
-        # 热门商品特征池
+        # 热门商品特征池（用目标模型特征）
         self.popular_features_tensor = None
 
-        # 加载CLIP模型
-        print(f"Loading CLIP ViT-B/32 on {self.device}...")
-        self.model, self.preprocess = clip.load('ViT-B/32', device=self.device)
-        self.model.eval()
+        # 加载代理模型集成（用于生成对抗样本）
+        print(f"\n{'='*60}")
+        print("Loading Surrogate Model Ensemble for Transfer Attack")
+        print(f"{'='*60}")
+        print(f"Target Model (VIP5): {TARGET_MODEL} - NOT used for attack")
+        print(f"Surrogate Models: {SURROGATE_MODELS}")
+        print(f"{'='*60}\n")
 
-        # 转换为float32以支持梯度计算（CLIP默认加载为fp16）
-        self.model = self.model.float()
+        self.surrogate_models = []
+        self.surrogate_preprocesses = []
 
-        # CLIP normalize参数
+        for model_name in SURROGATE_MODELS:
+            print(f"  Loading surrogate: {model_name}...")
+            try:
+                model, preprocess = clip.load(model_name, device=self.device)
+                model.eval()
+                model = model.float()  # 转换为float32
+                self.surrogate_models.append(model)
+                self.surrogate_preprocesses.append(preprocess)
+                print(f"    ✓ {model_name} loaded")
+            except Exception as e:
+                print(f"    ✗ Failed to load {model_name}: {e}")
+
+        if len(self.surrogate_models) == 0:
+            raise RuntimeError("No surrogate models loaded!")
+
+        print(f"\nLoaded {len(self.surrogate_models)} surrogate models")
+
+        # 加载目标模型（仅用于特征验证，不参与攻击优化）
+        print(f"\nLoading target model {TARGET_MODEL} (for validation only)...")
+        self.target_model, self.target_preprocess = clip.load(TARGET_MODEL, device=self.device)
+        self.target_model.eval()
+        self.target_model = self.target_model.float()
+
+        # CLIP normalize参数（所有CLIP模型共享）
         self.clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1).to(self.device)
         self.clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1).to(self.device)
 
-        print("Ready.")
+        print("Ready.\n")
 
     def _clip_normalize(self, tensor):
         """CLIP标准化（可微分）"""
         return (tensor - self.clip_mean) / self.clip_std
 
-    def _pil_to_tensor(self, img):
+    def _input_diversity(self, tensor):
         """
-        用CLIP的方式处理图片到224x224 tensor
+        Input Diversity Transform (DI-FGSM)
+        随机resize和padding，增强对抗样本的迁移性
+        """
+        if random.random() > self.diversity_prob:
+            return tensor
 
-        复刻CLIP preprocess: Resize(224, BICUBIC) + CenterCrop(224) + ToTensor
-        """
-        # CLIP方式: Resize最短边到224 + CenterCrop(224)
+        # 随机缩放
+        rnd = random.randint(200, 224)
+        rescaled = F.interpolate(tensor, size=(rnd, rnd), mode='bilinear', align_corners=False)
+
+        # 随机padding回224
+        h_rem = 224 - rnd
+        w_rem = 224 - rnd
+        pad_top = random.randint(0, h_rem)
+        pad_bottom = h_rem - pad_top
+        pad_left = random.randint(0, w_rem)
+        pad_right = w_rem - pad_left
+        padded = F.pad(rescaled, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
+
+        return padded
+
+    def _pil_to_tensor(self, img, size=224):
+        """用CLIP的方式处理图片到指定尺寸tensor"""
         w, h = img.size
-        scale = 224.0 / min(w, h)
+        scale = float(size) / min(w, h)
         new_w, new_h = int(w * scale), int(h * scale)
         img = img.resize((new_w, new_h), Image.BICUBIC)
 
-        # CenterCrop
-        left = (new_w - 224) // 2
-        top = (new_h - 224) // 2
-        img = img.crop((left, top, left + 224, top + 224))
+        left = (new_w - size) // 2
+        top = (new_h - size) // 2
+        img = img.crop((left, top, left + size, top + size))
 
         return transforms.ToTensor()(img).unsqueeze(0).to(self.device)
 
-    def extract_feature(self, image):
-        """用CLIP官方preprocess提取特征（和evaluate_attack.py完全一致）"""
-        image_input = self.preprocess(image).unsqueeze(0).to(self.device)
+    def extract_feature_target(self, image):
+        """用目标模型提取特征（和evaluate_attack.py一致）"""
+        image_input = self.target_preprocess(image).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            features = self.model.encode_image(image_input)
+            features = self.target_model.encode_image(image_input)
         return features.cpu().numpy().squeeze().astype(np.float32)
 
     def set_popular_features(self, features):
@@ -132,7 +190,6 @@ class TransferAttacker:
         pop_n = F.normalize(self.popular_features_tensor, p=2, dim=1)
         sims = torch.mm(feat_n, pop_n.t()).squeeze(0)
 
-        # 排除自身（高相似度）
         mask = sims < 0.99
         sims_masked = sims.clone()
         sims_masked[~mask] = -1.0
@@ -146,43 +203,66 @@ class TransferAttacker:
         weights = F.softmax(sims_masked[idx] * 5.0, dim=0).unsqueeze(1)
         return (top_feats * weights).sum(dim=0)
 
+    def _compute_ensemble_loss(self, perturbed, target_feat):
+        """
+        计算集成损失：聚合所有代理模型的损失
+
+        这是迁移攻击的核心：在多个不同的代理模型上优化
+        """
+        total_loss = 0.0
+
+        for model in self.surrogate_models:
+            # 应用Input Diversity
+            diverse_input = self._input_diversity(perturbed)
+            normalized = self._clip_normalize(diverse_input)
+
+            # 提取代理模型特征
+            features = model.encode_image(normalized)
+
+            # 计算损失
+            feat_n = F.normalize(features, p=2, dim=1)
+            tgt_n = F.normalize(target_feat.unsqueeze(0), p=2, dim=1)
+
+            cos_loss = 1.0 - F.cosine_similarity(feat_n, tgt_n, dim=1).mean()
+            total_loss += cos_loss
+
+        # 平均损失
+        return total_loss / len(self.surrogate_models)
+
     def attack_single(self, image, target_feat):
-        """MI-FGSM攻击"""
+        """
+        集成迁移攻击 (Ensemble Transfer Attack with MI-FGSM)
+
+        关键：使用代理模型集成生成对抗样本，不使用目标模型
+        """
         img_tensor = self._pil_to_tensor(image)
         original_tensor = img_tensor.clone()
         perturbed = img_tensor.clone()
         momentum_grad = torch.zeros_like(perturbed)
 
-        target = target_feat.unsqueeze(0)
-
         for _ in range(self.max_iter):
             perturbed.requires_grad = True
 
-            # 提取特征
-            features = self.model.encode_image(self._clip_normalize(perturbed))
-
-            # 组合损失：余弦（方向）+ L2（幅度）
-            feat_n = F.normalize(features, p=2, dim=1)
-            tgt_n = F.normalize(target, p=2, dim=1)
-            cos_loss = 1.0 - F.cosine_similarity(feat_n, tgt_n, dim=1).mean()
-            l2_loss = F.mse_loss(features, target)
-            loss = 0.7 * cos_loss + 0.3 * l2_loss / (l2_loss.detach() + 1e-8)
+            # 计算集成损失（在所有代理模型上）
+            loss = self._compute_ensemble_loss(perturbed, target_feat)
 
             loss.backward()
 
             with torch.no_grad():
                 grad = perturbed.grad
+
+                # MI-FGSM: 归一化梯度 + 动量
                 grad = grad / (torch.abs(grad).mean(dim=[1, 2, 3], keepdim=True) + 1e-8)
                 momentum_grad = self.momentum * momentum_grad + grad
+
+                # 更新扰动
                 perturbed = perturbed - self.step_size * momentum_grad.sign()
                 delta = torch.clamp(perturbed - original_tensor, -self.epsilon, self.epsilon)
                 perturbed = torch.clamp(original_tensor + delta, 0, 1)
 
             perturbed = perturbed.detach()
 
-        # 关键：返回224x224的PIL图片，不做任何缩放
-        # evaluate_attack.py的CLIP preprocess在224x224输入上是恒等变换
-        # 这样对抗扰动被完美保留
+        # 返回224x224的PIL图片
         result = perturbed.squeeze(0).cpu()
         result = torch.clamp(result, 0, 1)
         return transforms.ToPILImage()(result)
@@ -197,33 +277,37 @@ class TransferAttacker:
             image_files = random.sample(image_files, num_images)
 
         print(f"\n{'='*60}")
-        print(f"V5 Attack: {len(image_files)} images")
-        print(f"  Model: ViT-B/32 only")
-        print(f"  Epsilon: {self.epsilon}, Iter: {self.max_iter}, Step: {self.step_size:.6f}")
-        print(f"  Save size: 224x224 (no double-resize)")
+        print(f"Ensemble Transfer Attack v6")
+        print(f"{'='*60}")
+        print(f"  Target (VIP5): {TARGET_MODEL} - NOT used in optimization")
+        print(f"  Surrogates: {', '.join(SURROGATE_MODELS)}")
+        print(f"  Images: {len(image_files)}")
+        print(f"  Epsilon: {self.epsilon}, Iter: {self.max_iter}")
+        print(f"  Input Diversity: {self.diversity_prob*100:.0f}%")
         print(f"  Pool: {self.popular_features_tensor.shape[0] if self.popular_features_tensor is not None else 0} items")
         print(f"{'='*60}\n")
 
         results = {'success': 0, 'failed': 0, 'details': []}
 
-        for img_path in tqdm(image_files, desc="Attacking"):
+        for img_path in tqdm(image_files, desc="Transfer Attacking"):
             try:
                 original_img = Image.open(img_path).convert('RGB')
-                original_feat = self.extract_feature(original_img)
+                # 用目标模型提取原始特征
+                original_feat = self.extract_feature_target(original_img)
 
                 target_feat = self._find_target(original_feat)
                 if target_feat is None:
                     original_img.save(output_dir / img_path.name, quality=95)
                     continue
 
-                # 攻击
+                # 在代理模型上执行攻击
                 attacked_img = self.attack_single(original_img, target_feat)
 
-                # 关键：保存为224x224，保留对抗扰动
+                # 保存224x224
                 attacked_img.save(output_dir / img_path.name, quality=95)
 
-                # 验证：用CLIP官方preprocess重新提取特征（和evaluate_attack.py一致）
-                attacked_feat = self.extract_feature(attacked_img)
+                # 用目标模型验证攻击效果
+                attacked_feat = self.extract_feature_target(attacked_img)
 
                 feat_diff = np.linalg.norm(attacked_feat - original_feat)
                 target_np = target_feat.cpu().numpy()
@@ -249,15 +333,9 @@ class TransferAttacker:
 
 
 def load_popular_features(feature_dir: Path, split: str, top_k: int = 50) -> List[np.ndarray]:
-    """
-    加载热门商品特征 - 修复版
-
-    关键：使用正确的ID映射链
-    数字ID → ASIN → item2img_dict → 图片文件名 → 特征文件
-    """
+    """加载热门商品特征"""
     data_dir = SCRIPT_DIR / 'data' / split
 
-    # 统计商品频率
     seq_path = data_dir / 'sequential_data.txt'
     if not seq_path.exists():
         print(f"Sequential data not found: {seq_path}")
@@ -274,7 +352,6 @@ def load_popular_features(feature_dir: Path, split: str, top_k: int = 50) -> Lis
                 for item in (parts[-3:] if len(parts) > 3 else parts[1:]):
                     end_counts[item] += 1
 
-    # 综合得分：最后位置更重要
     scores = {}
     for item in set(list(end_counts.keys()) + list(global_counts.keys())):
         scores[item] = end_counts.get(item, 0) * 2 + global_counts.get(item, 0)
@@ -282,7 +359,6 @@ def load_popular_features(feature_dir: Path, split: str, top_k: int = 50) -> Lis
     popular_items = [item for item, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
     print(f"Found {len(popular_items)} items by popularity")
 
-    # 加载映射文件
     item2img_path = data_dir / 'item2img_dict.pkl'
     datamaps_path = data_dir / 'datamaps.json'
 
@@ -294,10 +370,8 @@ def load_popular_features(feature_dir: Path, split: str, top_k: int = 50) -> Lis
     datamaps = load_json(str(datamaps_path))
     id2item = datamaps.get('id2item', {})
 
-    # 建立 数字ID -> 图片文件名 的映射
     id_to_imgname = {}
     for asin_key, img_info in item2img_dict.items():
-        # 获取图片文件名
         if isinstance(img_info, str):
             img_filename = img_info
         elif isinstance(img_info, list) and len(img_info) > 0:
@@ -305,13 +379,11 @@ def load_popular_features(feature_dir: Path, split: str, top_k: int = 50) -> Lis
         else:
             continue
 
-        # 清理文件名
         if '/' in img_filename:
             img_filename = img_filename.split('/')[-1]
         if '.' in img_filename:
             img_filename = img_filename.rsplit('.', 1)[0]
 
-        # 找到对应的数字ID
         for num_id, asin in id2item.items():
             if asin == asin_key:
                 id_to_imgname[num_id] = img_filename
@@ -319,7 +391,6 @@ def load_popular_features(feature_dir: Path, split: str, top_k: int = 50) -> Lis
 
     print(f"Built ID to image name mapping: {len(id_to_imgname)} entries")
 
-    # 加载热门商品特征
     features = []
     loaded_count = 0
 
@@ -379,7 +450,7 @@ def _load_features_direct(feature_dir: Path, top_k: int = 50) -> List[np.ndarray
 
 
 def main():
-    parser = argparse.ArgumentParser(description='VIP5 Black-box Attack v5')
+    parser = argparse.ArgumentParser(description='VIP5 Ensemble Transfer Attack v6')
     parser.add_argument('--split', type=str, default='toys')
     parser.add_argument('--num_images', type=int, default=None)
     parser.add_argument('--epsilon', type=float, default=0.15,
@@ -387,6 +458,8 @@ def main():
     parser.add_argument('--max_iter', type=int, default=200)
     parser.add_argument('--step_size', type=float, default=None)
     parser.add_argument('--momentum', type=float, default=0.9)
+    parser.add_argument('--diversity_prob', type=float, default=0.5,
+                        help='Input diversity probability (default 0.5)')
     parser.add_argument('--top_k_popular', type=int, default=50)
     parser.add_argument('--device', type=str, default='cuda')
     args = parser.parse_args()
@@ -400,16 +473,22 @@ def main():
         sys.exit(1)
 
     print("\n" + "="*60)
-    print("VIP5 Black-box Attack v5")
+    print("VIP5 Ensemble Transfer Attack v6")
     print("="*60)
     print(f"Input: {image_dir}")
     print(f"Output: {output_dir}")
     print(f"Features: {feature_dir}")
+    print()
+    print("Transfer Attack Setup:")
+    print(f"  Target Model (VIP5): {TARGET_MODEL}")
+    print(f"  Surrogate Models: {SURROGATE_MODELS}")
+    print(f"  (Surrogates ≠ Target → True Transfer Attack)")
+    print("="*60)
 
-    attacker = TransferAttacker(
+    attacker = EnsembleTransferAttacker(
         device=args.device, epsilon=args.epsilon,
         max_iter=args.max_iter, step_size=args.step_size,
-        momentum=args.momentum,
+        momentum=args.momentum, diversity_prob=args.diversity_prob,
     )
 
     if feature_dir.exists():
@@ -420,18 +499,28 @@ def main():
     results = attacker.attack_batch(image_dir, output_dir, args.num_images)
 
     print(f"\n{'='*60}")
-    print(f"Done! Success: {results['success']}, Failed: {results['failed']}")
+    print(f"Transfer Attack Complete!")
+    print(f"{'='*60}")
+    print(f"Success: {results['success']}, Failed: {results['failed']}")
 
     valid = [d for d in results['details'] if 'feat_diff' in d]
     if valid:
         gains = [d['sim_gain'] for d in valid]
         pos = [g for g in gains if g > 0]
+        print(f"\nTransfer Attack Results (on target model {TARGET_MODEL}):")
         print(f"  Avg feature diff: {np.mean([d['feat_diff'] for d in valid]):.4f}")
         print(f"  Avg target sim gain: {np.mean(gains):+.4f}")
-        print(f"  Moved closer to target: {len(pos)}/{len(gains)} ({100*len(pos)/len(gains):.1f}%)")
+        print(f"  Successful transfers: {len(pos)}/{len(gains)} ({100*len(pos)/len(gains):.1f}%)")
 
     with open(output_dir / 'attack_results.json', 'w') as f:
-        json.dump({'method': 'v5', 'epsilon': args.epsilon, 'results': results}, f, indent=2)
+        json.dump({
+            'method': 'ensemble_transfer_v6',
+            'target_model': TARGET_MODEL,
+            'surrogate_models': SURROGATE_MODELS,
+            'epsilon': args.epsilon,
+            'diversity_prob': args.diversity_prob,
+            'results': results
+        }, f, indent=2)
 
     print(f"\nNext steps:")
     print(f"  python evaluate_attack.py --mode extract --split {args.split}")
