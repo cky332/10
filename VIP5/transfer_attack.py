@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-VIP5 Black-box Transfer Attack v4
+VIP5 Black-box Transfer Attack v5
 ===================================
 针对VIP5推荐系统的黑盒对抗攻击
 
-关键修复（v4）：
-1. 保存224x224图片 - 避免双重缩放销毁对抗扰动
-   v3的致命bug：攻击在224x224优化 → 放大回原始尺寸保存 → evaluate_attack.py
-   再缩回224x224提取特征，双重插值完全抹掉了微小的对抗扰动
-2. 大epsilon (0.15) - 视觉特征对VIP5影响有限，需要大扰动
-3. 单模型ViT-B/32 - VIP5只用这个模型
-4. 逐商品最近邻目标 - 攻击向最近的热门商品靠拢
+关键改进：
+1. 正确的ID映射：数字ID → ASIN → 图片文件名 → 特征文件
+2. 保存224x224图片 - 避免双重缩放销毁对抗扰动
+3. 逐商品最近邻目标 - 攻击向最近的热门商品靠拢
+4. MI-FGSM with momentum for stable gradients
 
 使用方法：
     python transfer_attack.py --split toys
@@ -20,13 +18,15 @@ VIP5 Black-box Transfer Attack v4
 import os
 import sys
 import argparse
+import pickle
+import json
 import numpy as np
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
-import json
 import random
 from typing import List, Dict, Optional, Tuple
+from collections import Counter
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -34,22 +34,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
-from collections import Counter
 
 import clip
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
+def load_pickle(filename):
+    with open(filename, "rb") as f:
+        return pickle.load(f)
+
+
+def load_json(file_path):
+    with open(file_path, "r") as f:
+        return json.load(f)
+
+
 class TransferAttacker:
     """
-    V4 转移攻击器
+    V5 转移攻击器
 
     核心设计：
     1. 只用ViT-B/32（匹配VIP5和evaluate_attack.py）
-    2. 用CLIP官方preprocess做可微分攻击
+    2. 用CLIP方式处理图片做可微分攻击
     3. 保存224x224图片，避免双重缩放销毁扰动
-    4. 大epsilon + 逐商品最近邻目标
+    4. 逐商品最近邻目标
     """
 
     def __init__(self, device='cuda', epsilon=0.15, max_iter=200,
@@ -60,7 +69,7 @@ class TransferAttacker:
         self.step_size = step_size if step_size else 2.0 * epsilon / max_iter
         self.momentum = momentum
 
-        # 热门商品特征库
+        # 热门商品特征池
         self.popular_features_tensor = None
 
         # 加载CLIP模型
@@ -120,7 +129,7 @@ class TransferAttacker:
         pop_n = F.normalize(self.popular_features_tensor, p=2, dim=1)
         sims = torch.mm(feat_n, pop_n.t()).squeeze(0)
 
-        # 排除自身
+        # 排除自身（高相似度）
         mask = sims < 0.99
         sims_masked = sims.clone()
         sims_masked[~mask] = -1.0
@@ -185,7 +194,7 @@ class TransferAttacker:
             image_files = random.sample(image_files, num_images)
 
         print(f"\n{'='*60}")
-        print(f"V4 Attack: {len(image_files)} images")
+        print(f"V5 Attack: {len(image_files)} images")
         print(f"  Model: ViT-B/32 only")
         print(f"  Epsilon: {self.epsilon}, Iter: {self.max_iter}, Step: {self.step_size:.6f}")
         print(f"  Save size: 224x224 (no double-resize)")
@@ -208,7 +217,6 @@ class TransferAttacker:
                 attacked_img = self.attack_single(original_img, target_feat)
 
                 # 关键：保存为224x224，保留对抗扰动
-                # 用原始文件名和格式
                 attacked_img.save(output_dir / img_path.name, quality=95)
 
                 # 验证：用CLIP官方preprocess重新提取特征（和evaluate_attack.py一致）
@@ -237,10 +245,19 @@ class TransferAttacker:
         return results
 
 
-def load_popular_features(feature_dir, split, top_k=50):
-    """加载热门商品特征"""
-    seq_path = SCRIPT_DIR / 'data' / split / 'sequential_data.txt'
+def load_popular_features(feature_dir: Path, split: str, top_k: int = 50) -> List[np.ndarray]:
+    """
+    加载热门商品特征 - 修复版
+
+    关键：使用正确的ID映射链
+    数字ID → ASIN → item2img_dict → 图片文件名 → 特征文件
+    """
+    data_dir = SCRIPT_DIR / 'data' / split
+
+    # 统计商品频率
+    seq_path = data_dir / 'sequential_data.txt'
     if not seq_path.exists():
+        print(f"Sequential data not found: {seq_path}")
         return []
 
     end_counts = Counter()
@@ -254,24 +271,112 @@ def load_popular_features(feature_dir, split, top_k=50):
                 for item in (parts[-3:] if len(parts) > 3 else parts[1:]):
                     end_counts[item] += 1
 
+    # 综合得分：最后位置更重要
     scores = {}
     for item in set(list(end_counts.keys()) + list(global_counts.keys())):
         scores[item] = end_counts.get(item, 0) * 2 + global_counts.get(item, 0)
 
-    features = []
-    for item_id, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True):
-        fp = feature_dir / f"{item_id}.npy"
-        if fp.exists():
-            features.append(np.load(fp).astype(np.float32))
-            if len(features) >= top_k:
+    popular_items = [item for item, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
+    print(f"Found {len(popular_items)} items by popularity")
+
+    # 加载映射文件
+    item2img_path = data_dir / 'item2img_dict.pkl'
+    datamaps_path = data_dir / 'datamaps.json'
+
+    if not item2img_path.exists() or not datamaps_path.exists():
+        print("Mapping files not found, trying direct loading...")
+        return _load_features_direct(feature_dir, top_k)
+
+    item2img_dict = load_pickle(str(item2img_path))
+    datamaps = load_json(str(datamaps_path))
+    id2item = datamaps.get('id2item', {})
+
+    # 建立 数字ID -> 图片文件名 的映射
+    id_to_imgname = {}
+    for asin_key, img_info in item2img_dict.items():
+        # 获取图片文件名
+        if isinstance(img_info, str):
+            img_filename = img_info
+        elif isinstance(img_info, list) and len(img_info) > 0:
+            img_filename = img_info[0]
+        else:
+            continue
+
+        # 清理文件名
+        if '/' in img_filename:
+            img_filename = img_filename.split('/')[-1]
+        if '.' in img_filename:
+            img_filename = img_filename.rsplit('.', 1)[0]
+
+        # 找到对应的数字ID
+        for num_id, asin in id2item.items():
+            if asin == asin_key:
+                id_to_imgname[num_id] = img_filename
                 break
 
+    print(f"Built ID to image name mapping: {len(id_to_imgname)} entries")
+
+    # 加载热门商品特征
+    features = []
+    loaded_count = 0
+
+    for item_id in popular_items:
+        if loaded_count >= top_k:
+            break
+
+        img_name = id_to_imgname.get(str(item_id))
+        if img_name is None:
+            continue
+
+        feat_path = feature_dir / f"{img_name}.npy"
+        if feat_path.exists():
+            try:
+                feat = np.load(feat_path).astype(np.float32)
+                features.append(feat)
+                loaded_count += 1
+            except Exception:
+                pass
+
     print(f"Loaded {len(features)} popular item features")
+
+    if len(features) == 0:
+        print("No features loaded via mapping, trying direct loading...")
+        return _load_features_direct(feature_dir, top_k)
+
+    return features
+
+
+def _load_features_direct(feature_dir: Path, top_k: int = 50) -> List[np.ndarray]:
+    """直接从特征目录加载特征（备用方案）"""
+    if not feature_dir.exists():
+        return []
+
+    feature_files = list(feature_dir.glob('*.npy'))
+    print(f"Direct loading from {len(feature_files)} feature files")
+
+    if len(feature_files) == 0:
+        return []
+
+    random.seed(42)
+    if len(feature_files) > top_k:
+        selected_files = random.sample(feature_files, top_k)
+    else:
+        selected_files = feature_files
+
+    features = []
+    for f in selected_files:
+        try:
+            feat = np.load(f).astype(np.float32)
+            features.append(feat)
+        except Exception:
+            pass
+
+    print(f"Loaded {len(features)} features directly")
     return features
 
 
 def main():
-    parser = argparse.ArgumentParser(description='VIP5 Black-box Attack v4')
+    parser = argparse.ArgumentParser(description='VIP5 Black-box Attack v5')
     parser.add_argument('--split', type=str, default='toys')
     parser.add_argument('--num_images', type=int, default=None)
     parser.add_argument('--epsilon', type=float, default=0.15,
@@ -288,7 +393,15 @@ def main():
     feature_dir = SCRIPT_DIR / 'features' / 'vitb32_features' / f'{args.split}_original'
 
     if not image_dir.exists():
-        print(f"Error: {image_dir} not found"); sys.exit(1)
+        print(f"Error: {image_dir} not found")
+        sys.exit(1)
+
+    print("\n" + "="*60)
+    print("VIP5 Black-box Attack v5")
+    print("="*60)
+    print(f"Input: {image_dir}")
+    print(f"Output: {output_dir}")
+    print(f"Features: {feature_dir}")
 
     attacker = TransferAttacker(
         device=args.device, epsilon=args.epsilon,
@@ -315,7 +428,7 @@ def main():
         print(f"  Moved closer to target: {len(pos)}/{len(gains)} ({100*len(pos)/len(gains):.1f}%)")
 
     with open(output_dir / 'attack_results.json', 'w') as f:
-        json.dump({'method': 'v4', 'epsilon': args.epsilon, 'results': results}, f, indent=2)
+        json.dump({'method': 'v5', 'epsilon': args.epsilon, 'results': results}, f, indent=2)
 
     print(f"\nNext steps:")
     print(f"  python evaluate_attack.py --mode extract --split {args.split}")
