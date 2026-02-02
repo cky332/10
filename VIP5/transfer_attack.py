@@ -86,6 +86,8 @@ class EnsembleTransferAttacker:
 
         # 热门商品特征池（用目标模型特征）
         self.popular_features_tensor = None
+        self.popular_image_paths = []
+        self.surrogate_popular_features = []
 
         # 加载代理模型集成（用于生成对抗样本）
         print(f"\n{'='*60}")
@@ -175,15 +177,43 @@ class EnsembleTransferAttacker:
         return features.cpu().numpy().squeeze().astype(np.float32)
 
     def set_popular_features(self, features):
-        """设置热门商品特征池"""
+        """设置热门商品特征池（用于目标模型验证）"""
         stacked = np.stack(features, axis=0)
         self.popular_features_tensor = torch.from_numpy(stacked).float().to(self.device)
         print(f"Target pool: {len(features)} popular items")
 
-    def _find_target(self, original_feat):
-        """为当前商品找最近邻热门商品作为攻击目标"""
+    def set_popular_images(self, image_paths: List[Path]):
+        """
+        设置热门商品图片路径
+        每个代理模型会提取自己的特征表示
+        """
+        self.popular_image_paths = image_paths
+        print(f"Popular images for surrogates: {len(image_paths)} images")
+
+        # 预提取每个代理模型的热门商品特征
+        self.surrogate_popular_features = []
+        for idx, model in enumerate(self.surrogate_models):
+            print(f"  Extracting features for surrogate {idx+1}/{len(self.surrogate_models)}...")
+            features = []
+            for img_path in image_paths[:50]:  # 限制数量
+                try:
+                    img = Image.open(img_path).convert('RGB')
+                    img_input = self.surrogate_preprocesses[idx](img).unsqueeze(0).to(self.device)
+                    with torch.no_grad():
+                        feat = model.encode_image(img_input)
+                    features.append(feat.squeeze(0))
+                except:
+                    pass
+            if features:
+                self.surrogate_popular_features.append(torch.stack(features))
+            else:
+                self.surrogate_popular_features.append(None)
+        print(f"  Done extracting surrogate features")
+
+    def _find_target_indices(self, original_feat):
+        """为当前商品找最近邻热门商品的索引（用于所有模型）"""
         if self.popular_features_tensor is None:
-            return None
+            return None, None
 
         feat = torch.from_numpy(original_feat).float().to(self.device).unsqueeze(0)
         feat_n = F.normalize(feat, p=2, dim=1)
@@ -196,22 +226,38 @@ class EnsembleTransferAttacker:
 
         k = min(3, mask.sum().item())
         if k == 0:
-            return self.popular_features_tensor[sims.argmax()]
+            idx = sims.argmax().unsqueeze(0)
+            weights = torch.ones(1, device=self.device)
+        else:
+            _, idx = sims_masked.topk(k)
+            weights = F.softmax(sims_masked[idx] * 5.0, dim=0)
 
-        _, idx = sims_masked.topk(k)
-        top_feats = self.popular_features_tensor[idx]
-        weights = F.softmax(sims_masked[idx] * 5.0, dim=0).unsqueeze(1)
-        return (top_feats * weights).sum(dim=0)
+        return idx, weights
 
-    def _compute_ensemble_loss(self, perturbed, target_feat):
+    def _get_surrogate_target(self, surrogate_idx, target_indices, weights):
+        """获取特定代理模型的目标特征"""
+        if self.surrogate_popular_features[surrogate_idx] is None:
+            return None
+        pop_feats = self.surrogate_popular_features[surrogate_idx]
+        target_feats = pop_feats[target_indices]
+        return (target_feats * weights.unsqueeze(1)).sum(dim=0)
+
+    def _compute_ensemble_loss(self, perturbed, target_indices, weights):
         """
         计算集成损失：聚合所有代理模型的损失
 
         这是迁移攻击的核心：在多个不同的代理模型上优化
+        每个代理模型使用自己的特征空间计算目标
         """
         total_loss = 0.0
+        valid_models = 0
 
-        for model in self.surrogate_models:
+        for idx, model in enumerate(self.surrogate_models):
+            # 获取该代理模型的目标特征
+            target_feat = self._get_surrogate_target(idx, target_indices, weights)
+            if target_feat is None:
+                continue
+
             # 应用Input Diversity
             diverse_input = self._input_diversity(perturbed)
             normalized = self._clip_normalize(diverse_input)
@@ -219,21 +265,26 @@ class EnsembleTransferAttacker:
             # 提取代理模型特征
             features = model.encode_image(normalized)
 
-            # 计算损失
+            # 计算损失（在该模型自己的特征空间内）
             feat_n = F.normalize(features, p=2, dim=1)
             tgt_n = F.normalize(target_feat.unsqueeze(0), p=2, dim=1)
 
             cos_loss = 1.0 - F.cosine_similarity(feat_n, tgt_n, dim=1).mean()
             total_loss += cos_loss
+            valid_models += 1
+
+        if valid_models == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
 
         # 平均损失
-        return total_loss / len(self.surrogate_models)
+        return total_loss / valid_models
 
-    def attack_single(self, image, target_feat):
+    def attack_single(self, image, target_indices, weights):
         """
         集成迁移攻击 (Ensemble Transfer Attack with MI-FGSM)
 
         关键：使用代理模型集成生成对抗样本，不使用目标模型
+        每个代理模型在自己的特征空间内优化
         """
         img_tensor = self._pil_to_tensor(image)
         original_tensor = img_tensor.clone()
@@ -243,8 +294,8 @@ class EnsembleTransferAttacker:
         for _ in range(self.max_iter):
             perturbed.requires_grad = True
 
-            # 计算集成损失（在所有代理模型上）
-            loss = self._compute_ensemble_loss(perturbed, target_feat)
+            # 计算集成损失（在所有代理模型上，使用各自的目标特征）
+            loss = self._compute_ensemble_loss(perturbed, target_indices, weights)
 
             loss.backward()
 
@@ -292,16 +343,17 @@ class EnsembleTransferAttacker:
         for img_path in tqdm(image_files, desc="Transfer Attacking"):
             try:
                 original_img = Image.open(img_path).convert('RGB')
-                # 用目标模型提取原始特征
+                # 用目标模型提取原始特征（用于找最近邻和验证）
                 original_feat = self.extract_feature_target(original_img)
 
-                target_feat = self._find_target(original_feat)
-                if target_feat is None:
+                # 找目标索引（在目标模型特征空间中）
+                target_indices, weights = self._find_target_indices(original_feat)
+                if target_indices is None:
                     original_img.save(output_dir / img_path.name, quality=95)
                     continue
 
-                # 在代理模型上执行攻击
-                attacked_img = self.attack_single(original_img, target_feat)
+                # 在代理模型上执行攻击（每个模型用自己的特征空间）
+                attacked_img = self.attack_single(original_img, target_indices, weights)
 
                 # 保存224x224
                 attacked_img.save(output_dir / img_path.name, quality=95)
@@ -310,11 +362,13 @@ class EnsembleTransferAttacker:
                 attacked_feat = self.extract_feature_target(attacked_img)
 
                 feat_diff = np.linalg.norm(attacked_feat - original_feat)
-                target_np = target_feat.cpu().numpy()
-                sim_before = np.dot(original_feat, target_np) / (
-                    np.linalg.norm(original_feat) * np.linalg.norm(target_np) + 1e-8)
-                sim_after = np.dot(attacked_feat, target_np) / (
-                    np.linalg.norm(attacked_feat) * np.linalg.norm(target_np) + 1e-8)
+                # 用目标模型的热门特征计算相似度变化
+                target_feat_np = self.popular_features_tensor[target_indices].cpu().numpy()
+                target_feat_weighted = (target_feat_np * weights.cpu().numpy()[:, np.newaxis]).sum(axis=0)
+                sim_before = np.dot(original_feat, target_feat_weighted) / (
+                    np.linalg.norm(original_feat) * np.linalg.norm(target_feat_weighted) + 1e-8)
+                sim_after = np.dot(attacked_feat, target_feat_weighted) / (
+                    np.linalg.norm(attacked_feat) * np.linalg.norm(target_feat_weighted) + 1e-8)
 
                 results['success'] += 1
                 results['details'].append({
@@ -332,14 +386,14 @@ class EnsembleTransferAttacker:
         return results
 
 
-def load_popular_features(feature_dir: Path, split: str, top_k: int = 50) -> List[np.ndarray]:
-    """加载热门商品特征"""
+def load_popular_features_and_images(feature_dir: Path, image_dir: Path, split: str, top_k: int = 50) -> Tuple[List[np.ndarray], List[Path]]:
+    """加载热门商品特征和图片路径"""
     data_dir = SCRIPT_DIR / 'data' / split
 
     seq_path = data_dir / 'sequential_data.txt'
     if not seq_path.exists():
         print(f"Sequential data not found: {seq_path}")
-        return []
+        return [], []
 
     end_counts = Counter()
     global_counts = Counter()
@@ -364,7 +418,7 @@ def load_popular_features(feature_dir: Path, split: str, top_k: int = 50) -> Lis
 
     if not item2img_path.exists() or not datamaps_path.exists():
         print("Mapping files not found, trying direct loading...")
-        return _load_features_direct(feature_dir, top_k)
+        return _load_features_direct(feature_dir, top_k), []
 
     item2img_dict = load_pickle(str(item2img_path))
     datamaps = load_json(str(datamaps_path))
@@ -392,6 +446,7 @@ def load_popular_features(feature_dir: Path, split: str, top_k: int = 50) -> Lis
     print(f"Built ID to image name mapping: {len(id_to_imgname)} entries")
 
     features = []
+    image_paths = []
     loaded_count = 0
 
     for item_id in popular_items:
@@ -403,21 +458,30 @@ def load_popular_features(feature_dir: Path, split: str, top_k: int = 50) -> Lis
             continue
 
         feat_path = feature_dir / f"{img_name}.npy"
-        if feat_path.exists():
+        # 查找对应的图片文件
+        img_path = None
+        for ext in ['.jpg', '.png', '.jpeg']:
+            candidate = image_dir / f"{img_name}{ext}"
+            if candidate.exists():
+                img_path = candidate
+                break
+
+        if feat_path.exists() and img_path is not None:
             try:
                 feat = np.load(feat_path).astype(np.float32)
                 features.append(feat)
+                image_paths.append(img_path)
                 loaded_count += 1
             except Exception:
                 pass
 
-    print(f"Loaded {len(features)} popular item features")
+    print(f"Loaded {len(features)} popular item features and images")
 
     if len(features) == 0:
         print("No features loaded via mapping, trying direct loading...")
-        return _load_features_direct(feature_dir, top_k)
+        return _load_features_direct(feature_dir, top_k), []
 
-    return features
+    return features, image_paths
 
 
 def _load_features_direct(feature_dir: Path, top_k: int = 50) -> List[np.ndarray]:
@@ -491,10 +555,19 @@ def main():
         momentum=args.momentum, diversity_prob=args.diversity_prob,
     )
 
+    # 加载原始图片目录（用于提取代理模型的热门商品特征）
+    original_image_dir = SCRIPT_DIR / f'{args.split}_original'
+    if not original_image_dir.exists():
+        original_image_dir = image_dir  # 如果没有原始目录，用当前目录
+
     if feature_dir.exists():
-        feats = load_popular_features(feature_dir, args.split, args.top_k_popular)
+        feats, img_paths = load_popular_features_and_images(
+            feature_dir, original_image_dir, args.split, args.top_k_popular
+        )
         if feats:
             attacker.set_popular_features(feats)
+        if img_paths:
+            attacker.set_popular_images(img_paths)
 
     results = attacker.attack_batch(image_dir, output_dir, args.num_images)
 
