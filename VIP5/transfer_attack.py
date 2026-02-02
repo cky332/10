@@ -86,7 +86,7 @@ class EnsembleTransferAttacker:
     def __init__(self, device='cuda', epsilon=0.15, max_iter=300,
                  step_size=None, momentum=1.0, diversity_prob=0.7,
                  ti_kernel_size=15, ti_sigma=3.0,
-                 si_num_scales=5, vmi_beta=1.5, vmi_num_samples=10,
+                 si_num_scales=3, vmi_beta=1.5, vmi_num_samples=3,
                  admix_ratio=0.2, admix_num=3):
         self.device = device if torch.cuda.is_available() else 'cpu'
         self.epsilon = epsilon
@@ -390,6 +390,8 @@ class EnsembleTransferAttacker:
                     n_loss.backward()
                     sample_grads.append(neighbor.grad.clone())
                     neighbor.requires_grad = False
+                    del n_loss, neighbor
+                    torch.cuda.empty_cache()
 
                 with torch.no_grad():
                     avg_neighbor_grad = torch.stack(sample_grads).mean(dim=0)
@@ -477,6 +479,8 @@ class EnsembleTransferAttacker:
                 import traceback
                 traceback.print_exc()
                 results['failed'] += 1
+            finally:
+                torch.cuda.empty_cache()
 
         return results
 
@@ -621,9 +625,9 @@ def main():
     parser.add_argument('--top_k_popular', type=int, default=50)
     parser.add_argument('--ti_kernel', type=int, default=15,
                         help='TI-FGSM Gaussian kernel size')
-    parser.add_argument('--si_scales', type=int, default=5,
+    parser.add_argument('--si_scales', type=int, default=3,
                         help='SI-FGSM number of scales')
-    parser.add_argument('--vmi_samples', type=int, default=10,
+    parser.add_argument('--vmi_samples', type=int, default=3,
                         help='VMI-FGSM neighborhood samples')
     parser.add_argument('--vmi_beta', type=float, default=1.5,
                         help='VMI-FGSM neighborhood radius factor')
