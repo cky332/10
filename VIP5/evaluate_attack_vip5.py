@@ -241,9 +241,69 @@ class AttackEvaluationDataset:
             print(f"Warning: item2img_dict.pkl not found at {item2img_path}")
             print("Will try to build mapping from feature files...")
             self.item2img_dict = {}
-        
+
         print(f"Loaded {len(self.user_list)} users, {len(self.item_list)} items")
-    
+
+        # 关键修复：建立反向映射 图片文件名 -> 数字ID
+        self._build_reverse_mapping()
+
+    def _build_reverse_mapping(self):
+        """
+        建立反向映射：图片文件名 -> 数字ID
+
+        这是关键修复！原来的映射方向是：
+            数字ID -> ASIN -> item2img_dict -> 图片文件名
+        但 id2item 的 value (ASIN) 和 item2img_dict 的 key 格式可能不同。
+
+        正确的做法是建立反向映射：
+            图片文件名 -> item2img_dict的key -> item2id -> 数字ID
+        """
+        self.imgname_to_itemid = {}  # 图片文件名 -> 数字ID
+        self.itemid_to_imgname = {}  # 数字ID -> 图片文件名
+
+        # 建立 图片文件名 -> item2img_dict的key 的反向映射
+        imgname_to_asin = {}
+        for asin_key, img_info in self.item2img_dict.items():
+            # 解析图片文件名
+            if isinstance(img_info, str):
+                img_filename = img_info
+            elif isinstance(img_info, list) and len(img_info) > 0:
+                img_filename = img_info[0]
+            elif isinstance(img_info, dict) and 'image' in img_info:
+                img_filename = img_info['image']
+            else:
+                continue
+
+            # 去掉路径和扩展名
+            if '/' in img_filename:
+                img_filename = img_filename.split('/')[-1]
+            if '.' in img_filename:
+                img_filename = img_filename.rsplit('.', 1)[0]
+
+            imgname_to_asin[img_filename] = asin_key
+
+        print(f"\nBuilding reverse mapping...")
+        print(f"  imgname_to_asin entries: {len(imgname_to_asin)}")
+
+        # 建立 图片文件名 -> 数字ID 的映射
+        # item2img_dict 的 key 应该与 item2id 的 key 相同
+        matched = 0
+        for img_filename, asin_key in imgname_to_asin.items():
+            # asin_key 是 item2img_dict 的 key，应该也是 item2id 的 key
+            if asin_key in self.item2id:
+                numeric_id = self.item2id[asin_key]
+                self.imgname_to_itemid[img_filename] = int(numeric_id)
+                self.itemid_to_imgname[int(numeric_id)] = img_filename
+                matched += 1
+
+        print(f"  Successfully mapped: {matched} items")
+        print(f"  imgname_to_itemid entries: {len(self.imgname_to_itemid)}")
+
+        # 打印示例
+        if len(self.imgname_to_itemid) > 0:
+            sample = list(self.imgname_to_itemid.items())[:3]
+            print(f"  Sample mapping: {sample}")
+
     def get_image_filename(self, item_id):
         """
         根据数字ID获取图片文件名
@@ -284,12 +344,18 @@ class AttackEvaluationDataset:
             feat_dir = SCRIPT_DIR / 'features' / f'{self.image_feature_type}_features' / f'{self.split}_attacked'
         else:
             feat_dir = SCRIPT_DIR / 'features' / f'{self.image_feature_type}_features' / f'{self.split}_original'
-        
-        # 获取图片文件名
-        img_filename = self.get_image_filename(item_id)
+
+        # 优先使用反向映射获取图片文件名
+        item_id_int = int(item_id)
+        img_filename = self.itemid_to_imgname.get(item_id_int)
+
+        # 如果反向映射没有，尝试正向映射
+        if img_filename is None:
+            img_filename = self.get_image_filename(item_id)
+
         if img_filename is None:
             return None
-        
+
         return feat_dir / f'{img_filename}.npy'
     
     def load_feature(self, item_id, attacked=False):
@@ -303,63 +369,61 @@ class AttackEvaluationDataset:
     def get_available_items(self, common_feature_files):
         """
         获取可用的商品列表（同时在数据集中且有特征文件）
-        
+
+        修复版：使用反向映射，从特征文件名出发找到数字ID
+
         Args:
             common_feature_files: 同时有原始和攻击特征的文件名集合
-        
+
         Returns:
             list: 可用的商品数字ID列表
         """
         available_items = []
-        missing_asin = 0
-        missing_img = 0
-        missing_feature = 0
-        
+        matched_via_reverse = 0
+        matched_via_forward = 0
+        no_mapping = 0
+
+        # 方法1：使用反向映射（推荐）
+        # 从特征文件名直接找到数字ID
+        for feat_name in common_feature_files:
+            if feat_name in self.imgname_to_itemid:
+                item_id = self.imgname_to_itemid[feat_name]
+                if item_id not in available_items:
+                    available_items.append(item_id)
+                    matched_via_reverse += 1
+
+        # 方法2：使用原来的正向映射作为补充
+        # 数字ID -> ASIN -> 图片文件名
         for item_id in self.id2item.keys():
-            asin = self.id2item.get(str(item_id))
-            
-            # 检查 asin 是否在 item2img_dict 中
-            if asin not in self.item2img_dict:
-                missing_asin += 1
-                continue
-            
-            img_filename = self.get_image_filename(item_id)
-            if img_filename is None:
-                missing_img += 1
-                continue
-                
-            if img_filename in common_feature_files:
-                available_items.append(int(item_id))
-            else:
-                missing_feature += 1
-        
+            item_id_int = int(item_id)
+            if item_id_int in available_items:
+                continue  # 已经通过反向映射找到了
+
+            img_filename = self.get_image_filename(item_id_int)
+            if img_filename and img_filename in common_feature_files:
+                available_items.append(item_id_int)
+                matched_via_forward += 1
+
         print(f"\n--- Debug: get_available_items ---")
-        print(f"Total items in id2item: {len(self.id2item)}")
-        print(f"Items missing from item2img_dict: {missing_asin}")
-        print(f"Items with invalid img_filename: {missing_img}")
-        print(f"Items missing feature files: {missing_feature}")
-        print(f"Available items: {len(available_items)}")
-        
+        print(f"Total feature files to match: {len(common_feature_files)}")
+        print(f"Matched via reverse mapping (imgname->itemid): {matched_via_reverse}")
+        print(f"Matched via forward mapping (itemid->imgname): {matched_via_forward}")
+        print(f"Total available items: {len(available_items)}")
+
         # 显示示例
         if len(available_items) > 0:
             sample_id = available_items[0]
-            sample_asin = self.id2item[str(sample_id)]
-            sample_img = self.get_image_filename(sample_id)
-            print(f"\nSample: item_id={sample_id}, asin={sample_asin}, img_filename={sample_img}")
-        
-        if missing_feature > 0 and len(available_items) == 0:
-            # 显示一个失败的例子
-            for item_id in list(self.id2item.keys())[:1]:
-                asin = self.id2item[str(item_id)]
-                if asin in self.item2img_dict:
-                    img_filename = self.get_image_filename(item_id)
-                    print(f"\nFailed example: item_id={item_id}, asin={asin}, img_filename={img_filename}")
-                    print(f"Looking for '{img_filename}' in feature files...")
-                    # 显示部分 common_feature_files
-                    sample_features = list(common_feature_files)[:5]
-                    print(f"Sample feature file names: {sample_features}")
-                    break
-        
+            sample_img = self.itemid_to_imgname.get(sample_id, "N/A")
+            print(f"\nSample: item_id={sample_id}, img_filename={sample_img}")
+
+        # 如果仍然没有匹配，显示调试信息
+        if len(available_items) == 0:
+            print(f"\nNo items matched! Debug info:")
+            sample_features = list(common_feature_files)[:5]
+            print(f"  Sample feature file names: {sample_features}")
+            sample_imgname = list(self.imgname_to_itemid.keys())[:5] if self.imgname_to_itemid else []
+            print(f"  Sample imgname_to_itemid keys: {sample_imgname}")
+
         return available_items
     
     def create_recommendation_sample(self, user_id, target_item_id, candidate_ids, 
@@ -613,35 +677,36 @@ def evaluate_attack(args, num_samples=100, num_candidates=20, verbose_samples=5)
     test_users = random.sample(users, min(num_samples, len(users)))
     
     print(f"\n{'='*70}")
-    print(f"Evaluating {len(test_users)} samples with {num_candidates} candidates each")
+    print(f"Evaluating {num_samples} samples with {num_candidates} candidates each")
     print(f"{'='*70}")
-    
+
     # 详细样本展示
     print(f"\n--- Detailed examples (first {verbose_samples}) ---")
-    
+
     results = []
-    
-    for i, user_id in enumerate(tqdm(test_users, desc="Evaluating")):
+
+    # 修复：从被攻击的商品中选择目标，而不是从用户历史中选择
+    # 这样才能真正评估攻击效果
+    attacked_items = list(available_items)  # 这些是被攻击且有映射的商品
+    random.shuffle(attacked_items)
+
+    for i, target_item_id in enumerate(tqdm(attacked_items[:num_samples], desc="Evaluating")):
+        # 随机选择一个用户
+        user_id = random.choice(users)
         user_seq = dataset.user_items[user_id]
-        
-        # 选择目标商品（从用户历史中选择最后一个作为目标）
-        if len(user_seq) < 2:
-            continue
-        
-        target_item_id = user_seq[-1]
-        
-        # 检查目标商品是否有攻击特征（使用图片文件名检查）
-        target_img_filename = dataset.get_image_filename(target_item_id)
-        if target_img_filename is None or target_img_filename not in common_items:
-            continue
-        
+
         # 选择候选商品（包括目标商品和负样本）
-        negative_pool = [item for item in available_items 
+        # 负样本从所有可用商品中选择（排除目标和用户历史）
+        negative_pool = [item for item in available_items
                         if item not in user_seq and item != target_item_id]
-        
+
+        if len(negative_pool) < num_candidates - 1:
+            # 如果负样本不够，放宽限制，只排除目标
+            negative_pool = [item for item in available_items if item != target_item_id]
+
         if len(negative_pool) < num_candidates - 1:
             continue
-        
+
         negative_samples = random.sample(negative_pool, num_candidates - 1)
         candidate_ids = negative_samples + [target_item_id]
         random.shuffle(candidate_ids)
@@ -684,8 +749,8 @@ def evaluate_attack(args, num_samples=100, num_candidates=20, verbose_samples=5)
         results.append(result)
         
         # 详细打印
-        if i < verbose_samples:
-            print(f"\n  Sample {i+1}:")
+        if len(results) <= verbose_samples:
+            print(f"\n  Sample {len(results)}:")
             print(f"  User: {user_id}, Target Item: {target_item_id}")
             print(f"  Original Rank: {original_rank}, Attacked Rank: {attacked_rank}")
             print(f"  Rank Change: {rank_change:+d} ({'improved' if rank_change > 0 else 'degraded' if rank_change < 0 else 'unchanged'})")
