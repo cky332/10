@@ -677,38 +677,36 @@ def evaluate_attack(args, num_samples=100, num_candidates=20, verbose_samples=5)
     test_users = random.sample(users, min(num_samples, len(users)))
     
     print(f"\n{'='*70}")
-    print(f"Evaluating {len(test_users)} samples with {num_candidates} candidates each")
+    print(f"Evaluating {num_samples} samples with {num_candidates} candidates each")
     print(f"{'='*70}")
-    
+
     # 详细样本展示
     print(f"\n--- Detailed examples (first {verbose_samples}) ---")
-    
-    results = []
-    
-    for i, user_id in enumerate(tqdm(test_users, desc="Evaluating")):
-        user_seq = dataset.user_items[user_id]
-        
-        # 选择目标商品（从用户历史中选择最后一个作为目标）
-        if len(user_seq) < 2:
-            continue
-        
-        target_item_id = user_seq[-1]
 
-        # 检查目标商品是否有攻击特征
-        # 优先使用反向映射，再尝试正向映射
-        target_img_filename = dataset.itemid_to_imgname.get(target_item_id)
-        if target_img_filename is None:
-            target_img_filename = dataset.get_image_filename(target_item_id)
-        if target_img_filename is None or target_img_filename not in common_items:
-            continue
-        
+    results = []
+
+    # 修复：从被攻击的商品中选择目标，而不是从用户历史中选择
+    # 这样才能真正评估攻击效果
+    attacked_items = list(available_items)  # 这些是被攻击且有映射的商品
+    random.shuffle(attacked_items)
+
+    for i, target_item_id in enumerate(tqdm(attacked_items[:num_samples], desc="Evaluating")):
+        # 随机选择一个用户
+        user_id = random.choice(users)
+        user_seq = dataset.user_items[user_id]
+
         # 选择候选商品（包括目标商品和负样本）
-        negative_pool = [item for item in available_items 
+        # 负样本从所有可用商品中选择（排除目标和用户历史）
+        negative_pool = [item for item in available_items
                         if item not in user_seq and item != target_item_id]
-        
+
+        if len(negative_pool) < num_candidates - 1:
+            # 如果负样本不够，放宽限制，只排除目标
+            negative_pool = [item for item in available_items if item != target_item_id]
+
         if len(negative_pool) < num_candidates - 1:
             continue
-        
+
         negative_samples = random.sample(negative_pool, num_candidates - 1)
         candidate_ids = negative_samples + [target_item_id]
         random.shuffle(candidate_ids)
@@ -751,8 +749,8 @@ def evaluate_attack(args, num_samples=100, num_candidates=20, verbose_samples=5)
         results.append(result)
         
         # 详细打印
-        if i < verbose_samples:
-            print(f"\n  Sample {i+1}:")
+        if len(results) <= verbose_samples:
+            print(f"\n  Sample {len(results)}:")
             print(f"  User: {user_id}, Target Item: {target_item_id}")
             print(f"  Original Rank: {original_rank}, Attacked Rank: {attacked_rank}")
             print(f"  Rank Change: {rank_change:+d} ({'improved' if rank_change > 0 else 'degraded' if rank_change < 0 else 'unchanged'})")
